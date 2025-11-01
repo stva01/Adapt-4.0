@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Adapt Security CLI - AI-Powered Code Security Review
+Adapt Security CLI & Webhook - AI-Powered Code Security Review
 Inspired by CodeRabbit, powered by Groq AI
 """
 
@@ -8,6 +8,8 @@ import os
 import sys
 import subprocess
 import json
+import hmac
+import hashlib
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime
@@ -22,17 +24,24 @@ from rich.syntax import Syntax
 from rich import box
 from rich.prompt import Confirm
 
+# Web server imports
+from flask import Flask, request, jsonify, Response
+
 console = Console()
+app = Flask(__name__)
 
 class AdaptSecurityCLI:
-    def __init__(self):
+    def __init__(self, repo_path=None):
         self.groq_api_key = os.environ.get('GROQ_API_KEY')
         if not self.groq_api_key:
             console.print("[red]❌ GROQ_API_KEY not found in environment variables[/red]")
             sys.exit(1)
         
         self.client = Groq(api_key=self.groq_api_key)
-        self.repo_root = self._get_repo_root()
+        if repo_path:
+            self.repo_root = Path(repo_path)
+        else:
+            self.repo_root = self._get_repo_root()
         
     def _get_repo_root(self) -> Path:
         """Get the git repository root directory"""
@@ -85,6 +94,67 @@ class AdaptSecurityCLI:
         except subprocess.CalledProcessError as e:
             console.print(f"[red]❌ Error getting staged changes: {e}[/red]")
             return []
+
+    def _get_changes_between_commits(self, base_commit: str, head_commit: str) -> List[Dict[str, str]]:
+        """Get all changes between two commits as diffs"""
+        try:
+            # Get list of changed files
+            result = subprocess.run(
+                ['git', 'diff', '--name-only', base_commit, head_commit],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            
+            if not result.stdout.strip():
+                return []
+            
+            files = result.stdout.strip().split('\n')
+            changes = []
+            
+            for file in files:
+                # Get the diff for each file
+                diff_result = subprocess.run(
+                    ['git', 'diff', base_commit, head_commit, '--', file],
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                
+                changes.append({
+                    'filename': file,
+                    'diff': diff_result.stdout,
+                    'status': self._get_file_status_between_commits(base_commit, head_commit, file)
+                })
+            
+            return changes
+            
+        except subprocess.CalledProcessError as e:
+            console.print(f"[red]❌ Error getting changes between commits: {e}[/red]")
+            return []
+
+    def _get_file_status_between_commits(self, base_commit: str, head_commit: str, filename: str) -> str:
+        """Get the status of a file between two commits"""
+        try:
+            # Check if file was added, modified, or deleted
+            result = subprocess.run(
+                ['git', 'diff', '--name-status', base_commit, head_commit, '--', filename],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            
+            if result.stdout:
+                status_code = result.stdout[0]
+                status_map = {
+                    'A': 'Added',
+                    'M': 'Modified', 
+                    'D': 'Deleted'
+                }
+                return status_map.get(status_code, 'Modified')
+            return 'Modified'
+        except:
+            return 'Modified'
     
     def _get_file_status(self, filename: str) -> str:
         """Get the git status of a file"""
@@ -298,16 +368,19 @@ Be thorough but also acknowledge good security practices."""
         
         console.print(f"[dim]💾 Report saved to: {report_file}[/dim]\n")
     
-    def review(self, save_report: bool = True):
+    def review(self, save_report: bool = True, base_commit: str = None, head_commit: str = None):
         """Main review function"""
         console.print("[bold blue]🚀 Starting Adapt Security Review...[/bold blue]\n")
         
-        # Get staged changes
-        changes = self._get_staged_changes()
+        # Get changes based on input type
+        if base_commit and head_commit:
+            changes = self._get_changes_between_commits(base_commit, head_commit)
+        else:
+            changes = self._get_staged_changes()
         
         if not changes:
-            console.print("[yellow]⚠️  No staged changes found. Use 'git add' first.[/yellow]")
-            return
+            console.print("[yellow]⚠️  No changes found.[/yellow]")
+            return None
         
         console.print(f"[cyan]Found {len(changes)} file(s) to review[/cyan]\n")
         
@@ -316,7 +389,7 @@ Be thorough but also acknowledge good security practices."""
         
         if not analysis:
             console.print("[red]❌ Analysis failed[/red]")
-            return
+            return None
         
         # Display results
         self._display_results(analysis, changes)
@@ -325,20 +398,7 @@ Be thorough but also acknowledge good security practices."""
         if save_report:
             self._save_report(analysis, changes)
         
-        # Ask to proceed
-        is_safe = analysis.get('is_safe_to_commit', True)
-        
-        if not is_safe:
-            console.print("[bold red]⚠️  SECURITY ISSUES DETECTED[/bold red]")
-            console.print("[yellow]It's recommended to fix the issues before committing.[/yellow]\n")
-            
-            if Confirm.ask("Do you want to proceed with commit anyway?"):
-                console.print("[yellow]⚠️  Proceeding with commit (not recommended)[/yellow]")
-            else:
-                console.print("[green]✅ Commit cancelled. Fix the issues and try again.[/green]")
-                sys.exit(1)
-        else:
-            console.print("[bold green]✅ All checks passed! Safe to commit.[/bold green]")
+        return analysis
     
     def history(self, limit: int = 10):
         """Show review history"""
@@ -380,6 +440,153 @@ Be thorough but also acknowledge good security practices."""
         
         console.print(table)
 
+# Webhook Handler Functions
+def verify_webhook_signature(payload_body, secret_token, signature_header):
+    """Verify that the webhook signature matches our secret"""
+    if not secret_token:
+        console.print("[yellow]⚠️  No webhook secret configured, skipping signature verification[/yellow]")
+        return True  # No secret configured
+    
+    if not signature_header:
+        console.print("[red]❌ No signature header received[/red]")
+        return False
+    
+    # GitHub prefixes the signature with "sha256="
+    if signature_header.startswith('sha256='):
+        signature_header = signature_header[7:]
+    
+    # Create our own signature
+    mac = hmac.new(
+        secret_token.encode('utf-8'),
+        msg=payload_body,
+        digestmod=hashlib.sha256
+    )
+    expected_signature = mac.hexdigest()
+    
+    # Compare signatures
+    is_valid = hmac.compare_digest(expected_signature, signature_header)
+    
+    if not is_valid:
+        console.print(f"[red]❌ Signature verification failed[/red]")
+        console.print(f"[dim]Expected: {expected_signature}[/dim]")
+        console.print(f"[dim]Received: {signature_header}[/dim]")
+    
+    return is_valid
+
+@app.route('/webhook', methods=['POST', 'GET'])
+def handle_webhook():
+    """Handle GitHub webhook requests"""
+    if request.method == 'GET':
+        return jsonify({'message': 'Adapt Security Webhook is running', 'status': 'ok'}), 200
+    
+    # Get webhook secret from environment
+    webhook_secret = os.environ.get('WEBHOOK_SECRET', '')
+    
+    # Verify signature if secret is configured
+    signature = request.headers.get('X-Hub-Signature-256', '')
+    
+    console.print(f"[dim]Webhook received: {request.headers.get('X-GitHub-Event', 'unknown')}[/dim]")
+    console.print(f"[dim]Signature present: {bool(signature)}[/dim]")
+    console.print(f"[dim]Secret configured: {bool(webhook_secret)}[/dim]")
+    
+    if not verify_webhook_signature(request.data, webhook_secret, signature):
+        return jsonify({'error': 'Invalid signature'}), 403
+    
+    # Get event type
+    event_type = request.headers.get('X-GitHub-Event', 'ping')
+    
+    if event_type == 'ping':
+        console.print("[green]✅ Webhook ping received and verified[/green]")
+        return jsonify({'message': 'pong'}), 200
+    
+    elif event_type == 'push':
+        console.print("[green]✅ Push event received and verified[/green]")
+        return handle_push_event(request.json)
+    
+    else:
+        console.print(f"[yellow]⚠️  Unsupported event type: {event_type}[/yellow]")
+        return jsonify({'message': f'Event {event_type} not supported'}), 200
+
+def handle_push_event(payload):
+    """Handle push events from GitHub"""
+    try:
+        # Extract repository information
+        repo_name = payload['repository']['name']
+        repo_full_name = payload['repository']['full_name']
+        clone_url = payload['repository']['clone_url']
+        
+        # Extract commit information
+        base_commit = payload['before']
+        head_commit = payload['after']
+        branch = payload['ref'].replace('refs/heads/', '')
+        
+        console.print(f"[green]📦 Processing push to {repo_full_name} on branch {branch}[/green]")
+        console.print(f"[dim]Commits: {base_commit[:8]} → {head_commit[:8]}[/dim]")
+        
+        # Skip if this is a delete event or initial commit
+        if base_commit == '0' * 40:
+            console.print("[yellow]⚠️  Initial commit, skipping analysis[/yellow]")
+            return jsonify({'message': 'Initial commit, no changes to analyze'}), 200
+        
+        if head_commit == '0' * 40:
+            console.print("[yellow]⚠️  Branch deletion, skipping analysis[/yellow]")
+            return jsonify({'message': 'Branch deletion, no changes to analyze'}), 200
+        
+        # Create temporary directory for the repository
+        import tempfile
+        import shutil
+        
+        temp_dir = tempfile.mkdtemp(prefix=f"adapt_{repo_name}_")
+        
+        try:
+            # Clone the repository
+            console.print(f"[cyan]Cloning repository to {temp_dir}...[/cyan]")
+            clone_result = subprocess.run([
+                'git', 'clone', '--depth=10', clone_url, temp_dir
+            ], check=True, capture_output=True, text=True)
+            
+            # Analyze the changes
+            os.chdir(temp_dir)  # Change to the repo directory
+            cli = AdaptSecurityCLI(temp_dir)
+            analysis = cli.review(
+                save_report=False,
+                base_commit=base_commit,
+                head_commit=head_commit
+            )
+            
+            if analysis:
+                # Prepare response
+                response = {
+                    'repository': repo_full_name,
+                    'branch': branch,
+                    'analysis': analysis,
+                    'timestamp': datetime.now().isoformat()
+                }
+                
+                # Log results
+                risk_level = analysis.get('overall_risk', 'unknown')
+                security_score = analysis.get('security_score', 0)
+                issues_count = len(analysis.get('vulnerabilities', []))
+                
+                console.print(f"[bold]Webhook Analysis Complete:[/bold]")
+                console.print(f"  Risk Level: {risk_level}")
+                console.print(f"  Security Score: {security_score}/100")
+                console.print(f"  Issues Found: {issues_count}")
+                
+                return jsonify(response), 200
+            else:
+                return jsonify({'error': 'Analysis failed'}), 500
+                
+        finally:
+            # Clean up temporary directory
+            os.chdir('/')  # Change back to root to avoid permission issues
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            
+    except Exception as e:
+        console.print(f"[red]❌ Error processing push event: {e}[/red]")
+        import traceback
+        console.print(f"[dim]{traceback.format_exc()}[/dim]")
+        return jsonify({'error': str(e)}), 500
 
 def main():
     parser = argparse.ArgumentParser(
@@ -391,6 +598,7 @@ Examples:
   adapt review --no-save    # Review without saving report
   adapt history             # Show review history
   adapt history --limit 20  # Show last 20 reviews
+  adapt serve               # Start webhook server
         """
     )
     
@@ -404,19 +612,40 @@ Examples:
     history_parser = subparsers.add_parser('history', help='Show review history')
     history_parser.add_argument('--limit', type=int, default=10, help='Number of reports to show')
     
+    # Serve command
+    serve_parser = subparsers.add_parser('serve', help='Start webhook server')
+    serve_parser.add_argument('--host', default='0.0.0.0', help='Host to bind to (default: 0.0.0.0)')
+    serve_parser.add_argument('--port', type=int, default=5000, help='Port to bind to (default: 5000)')
+    serve_parser.add_argument('--no-verify', action='store_true', help='Disable webhook signature verification')
+    
     args = parser.parse_args()
     
     if not args.command:
         parser.print_help()
         return
     
-    cli = AdaptSecurityCLI()
+    if args.command == 'serve':
+        if args.no_verify:
+            console.print("[yellow]⚠️  Webhook signature verification disabled[/yellow]")
+            os.environ['WEBHOOK_SECRET'] = ''
+        
+        console.print(f"[bold green]🚀 Starting Adapt Security Webhook Server...[/bold green]")
+        console.print(f"[cyan]Listening on {args.host}:{args.port}[/cyan]")
+        console.print(f"[dim]Webhook URL: https://your-ngrok-subdomain.ngrok-free.app/webhook[/dim]")
+        if os.environ.get('WEBHOOK_SECRET'):
+            console.print(f"[green]✅ Webhook signature verification enabled[/green]")
+        else:
+            console.print(f"[yellow]⚠️  Webhook signature verification disabled[/yellow]")
+        
+        app.run(host=args.host, port=args.port, debug=False)
     
-    if args.command == 'review':
-        cli.review(save_report=not args.no_save)
-    elif args.command == 'history':
-        cli.history(limit=args.limit)
-
+    else:
+        cli = AdaptSecurityCLI()
+        
+        if args.command == 'review':
+            cli.review(save_report=not args.no_save)
+        elif args.command == 'history':
+            cli.history(limit=args.limit)
 
 if __name__ == '__main__':
     main()
