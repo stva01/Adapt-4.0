@@ -1,489 +1,422 @@
-from fastapi import FastAPI, HTTPException, Request, Header
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
-from groq import Groq
-import httpx
+#!/usr/bin/env python3
+"""
+Adapt Security CLI - AI-Powered Code Security Review
+Inspired by CodeRabbit, powered by Groq AI
+"""
+
 import os
+import sys
+import subprocess
 import json
-import hmac
-import hashlib
-from typing import Optional, Union, Dict, Any
-from enum import IntEnum
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple
+from datetime import datetime
+import argparse
+from groq import Groq
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.markdown import Markdown
+from rich.syntax import Syntax
+from rich import box
+from rich.prompt import Confirm
 
-# Configuration
-SEND_URL = "http://localhost:8008"  # Fixed URL format
-GITHUB_SECRET = os.environ.get('GITHUB_WEBHOOK_SECRET')
-GROQ_API_KEY = os.environ.get('GROQ_API_KEY')
-GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')
+console = Console()
 
-# Initialize FastAPI app
-app = FastAPI(
-    title="Cyber Security API",
-    description="Combined API for threat classification and GitHub webhook security analysis using Groq AI",
-    version="1.0.0"
-)
-
-# Groq client initialization
-groq_client = Groq(
-    api_key=GROQ_API_KEY
-)
-
-# Define threat levels
-class ThreatLevel(IntEnum):
-    MINIMAL = 1
-    LOW = 2
-    MEDIUM = 3
-    HIGH = 4
-    CRITICAL = 5
-
-# Request model for threat analysis
-class ThreatAnalysisRequest(BaseModel):
-    data: Union[str, Dict[str, Any]] = Field(
-        ...,
-        description="Unstructured data as string or JSON object to analyze for cyber threats"
-    )
-    model: Optional[str] = Field(
-        default="llama-3.3-70b-versatile",
-        description="Groq model to use for analysis"
-    )
-
-# Response model for threat analysis
-class ThreatAnalysisResponse(BaseModel):
-    threat_level: int = Field(..., ge=1, le=5, description="Threat level from 1-5")
-    threat_category: str = Field(..., description="Category of the threat")
-    analysis: str = Field(..., description="Detailed analysis of the threat")
-    raw_data: Union[str, Dict[str, Any]] = Field(..., description="Original input data")
-    model_used: str = Field(..., description="Groq model used for analysis")
-
-# Endpoint forwarding model
-class ForwardedResult(BaseModel):
-    success: bool
-    message: str
-    original_response: Optional[ThreatAnalysisResponse] = None
-
-# GitHub webhook models
-class GitHubWebhookResponse(BaseModel):
-    status: str
-    reason: Optional[str] = None
-    severity: Optional[str] = None
-    recommendation: Optional[str] = None
-
-# Helper functions for threat analysis
-def create_threat_analysis_prompt(data: Union[str, Dict[str, Any]]) -> str:
-    """Create a detailed prompt for threat analysis"""
+class AdaptSecurityCLI:
+    def __init__(self):
+        self.groq_api_key = os.environ.get('GROQ_API_KEY')
+        if not self.groq_api_key:
+            console.print("[red]❌ GROQ_API_KEY not found in environment variables[/red]")
+            sys.exit(1)
+        
+        self.client = Groq(api_key=self.groq_api_key)
+        self.repo_root = self._get_repo_root()
+        
+    def _get_repo_root(self) -> Path:
+        """Get the git repository root directory"""
+        try:
+            result = subprocess.run(
+                ['git', 'rev-parse', '--show-toplevel'],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            return Path(result.stdout.strip())
+        except subprocess.CalledProcessError:
+            console.print("[red]❌ Not a git repository[/red]")
+            sys.exit(1)
     
-    # Convert dict to string if needed
-    if isinstance(data, dict):
-        data_str = json.dumps(data, indent=2)
-    else:
-        data_str = str(data)
+    def _get_staged_changes(self) -> List[Dict[str, str]]:
+        """Get all staged changes as diffs"""
+        try:
+            # Get list of staged files
+            result = subprocess.run(
+                ['git', 'diff', '--cached', '--name-only'],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            
+            if not result.stdout.strip():
+                return []
+            
+            files = result.stdout.strip().split('\n')
+            changes = []
+            
+            for file in files:
+                # Get the diff for each file
+                diff_result = subprocess.run(
+                    ['git', 'diff', '--cached', file],
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                
+                changes.append({
+                    'filename': file,
+                    'diff': diff_result.stdout,
+                    'status': self._get_file_status(file)
+                })
+            
+            return changes
+            
+        except subprocess.CalledProcessError as e:
+            console.print(f"[red]❌ Error getting staged changes: {e}[/red]")
+            return []
     
-    prompt = f"""You are a cyber security expert analyzing potential security threats. 
-Analyze the following data and classify it as a cyber security threat on a scale of 1-5:
+    def _get_file_status(self, filename: str) -> str:
+        """Get the git status of a file"""
+        try:
+            result = subprocess.run(
+                ['git', 'status', '--short', filename],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            status_code = result.stdout[:2].strip()
+            status_map = {
+                'M': 'Modified',
+                'A': 'Added',
+                'D': 'Deleted',
+                'R': 'Renamed',
+                'C': 'Copied'
+            }
+            return status_map.get(status_code, 'Modified')
+        except:
+            return 'Unknown'
+    
+    def _analyze_with_groq(self, changes: List[Dict[str, str]]) -> Dict:
+        """Analyze code changes with Groq AI"""
+        
+        # Prepare code context
+        code_context = "\n\n".join([
+            f"File: {change['filename']} ({change['status']})\n```diff\n{change['diff']}\n```"
+            for change in changes
+        ])
+        
+        prompt = f"""You are an expert security code reviewer. Analyze these code changes comprehensively.
 
-1 = MINIMAL - No apparent threat, normal activity
-2 = LOW - Suspicious but likely benign, minimal concern
-3 = MEDIUM - Potentially malicious activity, requires monitoring
-4 = HIGH - Likely malicious activity, immediate attention needed
-5 = CRITICAL - Active attack or severe vulnerability, urgent response required
+{code_context}
 
-Data to analyze:
-{data_str}
-
-Provide your response in the following JSON format:
+Provide a detailed security analysis in JSON format:
 {{
-    "threat_level": <1-5>,
-    "threat_category": "<category name such as: Malware, Phishing, DDoS, SQL Injection, Unauthorized Access, Data Exfiltration, Normal Activity, etc.>",
-    "analysis": "<detailed explanation of why you assigned this threat level, including specific indicators and reasoning>"
+    "overall_risk": "safe|low|medium|high|critical",
+    "is_safe_to_commit": true/false,
+    "summary": "Brief one-line summary",
+    "vulnerabilities": [
+        {{
+            "file": "filename",
+            "line": "approximate line number or range",
+            "severity": "low|medium|high|critical",
+            "type": "vulnerability type (e.g., SQL Injection, XSS, etc.)",
+            "description": "detailed description",
+            "recommendation": "how to fix it",
+            "code_snippet": "the problematic code"
+        }}
+    ],
+    "security_score": 0-100,
+    "positive_findings": ["list of good security practices found"],
+    "recommendations": ["general recommendations for improvement"]
 }}
 
-Only respond with valid JSON, no additional text."""
-    
-    return prompt
-
-# Helper functions for GitHub webhook
-def verify_signature(payload_body: bytes, signature_header: Optional[str]) -> bool:
-    """Verify that the payload was sent from GitHub"""
-    if not signature_header or not GITHUB_SECRET:
-        return False
-    
-    hash_object = hmac.new(
-        GITHUB_SECRET.encode('utf-8'),
-        msg=payload_body,
-        digestmod=hashlib.sha256
-    )
-    expected_signature = "sha256=" + hash_object.hexdigest()
-    return hmac.compare_digest(expected_signature, signature_header)
-
-async def analyze_code_with_groq(files_changed: list) -> Optional[str]:
-    """Send code changes to Groq for security analysis"""
-    code_content = "\n\n".join([
-        f"File: {file['filename']}\n```\n{file.get('patch', '')}\n```"
-        for file in files_changed if file.get('patch')
-    ])
-    
-    if not code_content:
-        return None
-    
-    prompt = f"""Analyze the following code changes for security vulnerabilities. 
 Focus on:
-- SQL injection risks
-- XSS vulnerabilities
+- SQL injection, XSS, CSRF vulnerabilities
 - Authentication/authorization issues
-- Hardcoded secrets or credentials
-- Unsafe file operations
-- Command injection risks
-- Insecure dependencies
+- Hardcoded secrets, API keys, passwords
+- Insecure cryptography
+- Command injection
+- Path traversal
+- Insecure deserialization
+- Dependency vulnerabilities
+- Information disclosure
+- Logic flaws
 
-Code changes:
-{code_content}
+Be thorough but also acknowledge good security practices."""
 
-Respond in JSON format:
-{{
-    "is_safe": true/false,
-    "vulnerabilities": ["list of issues found"],
-    "severity": "low/medium/high/critical",
-    "recommendation": "brief recommendation"
-}}"""
-
-    try:
-        response = groq_client.chat.completions.create(
-            model="llama-3.1-70b-versatile",
-            messages=[
-                {"role": "system", "content": "You are a security expert analyzing code for vulnerabilities."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.1,
-            max_tokens=2000
-        )
+        try:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[cyan]Analyzing code with AI..."),
+                console=console
+            ) as progress:
+                progress.add_task("analyze", total=None)
+                
+                response = self.client.chat.completions.create(
+                    model="llama-3.1-70b-versatile",
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "You are a senior security engineer and code reviewer. Provide detailed, actionable security feedback."
+                        },
+                        {
+                            "role": "user",
+                            "content": prompt
+                        }
+                    ],
+                    temperature=0.1,
+                    max_tokens=4000,
+                    response_format={"type": "json_object"}
+                )
+            
+            return json.loads(response.choices[0].message.content)
+            
+        except Exception as e:
+            console.print(f"[red]❌ Groq API error: {e}[/red]")
+            return None
+    
+    def _display_results(self, analysis: Dict, changes: List[Dict[str, str]]):
+        """Display analysis results in a beautiful format"""
         
-        return response.choices[0].message.content
-    except Exception as e:
-        print(f"Groq API error: {e}")
-        return None
-
-async def block_push(repo_full_name: str, commit_sha: str, reason: str) -> bool:
-    """Create a commit status to block the push"""
-    if not GITHUB_TOKEN:
-        return False
-    
-    url = f"https://api.github.com/repos/{repo_full_name}/statuses/{commit_sha}"
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.v3+json"
-    }
-    data = {
-        "state": "failure",
-        "description": reason[:140],  # GitHub limits to 140 chars
-        "context": "groq-security-review"
-    }
-    
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(url, headers=headers, json=data, timeout=10.0)
-            return response.status_code == 201
-    except Exception as e:
-        print(f"Error blocking push: {e}")
-        return False
-
-async def approve_push(repo_full_name: str, commit_sha: str) -> bool:
-    """Create a commit status to approve the push"""
-    if not GITHUB_TOKEN:
-        return False
-    
-    url = f"https://api.github.com/repos/{repo_full_name}/statuses/{commit_sha}"
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.v3+json"
-    }
-    data = {
-        "state": "success",
-        "description": "No security vulnerabilities detected",
-        "context": "groq-security-review"
-    }
-    
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(url, headers=headers, json=data, timeout=10.0)
-            return response.status_code == 201
-    except Exception as e:
-        print(f"Error approving push: {e}")
-        return False
-
-# Root endpoint
-@app.get("/")
-async def root():
-    """Root endpoint with API information"""
-    return {
-        "message": "Cyber Security API - Combined Threat Classifier and GitHub Webhook Security",
-        "version": "1.0.0",
-        "endpoints": {
-            "/analyze": "POST - Analyze data for cyber threats",
-            "/webhook": "POST - GitHub webhook for code security analysis",
-            "/health": "GET - Check API health",
-            "/test-example": "POST - Test endpoint with example data"
+        console.print()
+        
+        # Header
+        risk_level = analysis.get('overall_risk', 'unknown').upper()
+        risk_colors = {
+            'SAFE': 'green',
+            'LOW': 'yellow',
+            'MEDIUM': 'orange',
+            'HIGH': 'red',
+            'CRITICAL': 'bold red'
         }
-    }
-
-# Health check endpoint
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {"status": "healthy", "service": "cyber-security-api"}
-
-# Threat analysis endpoint
-@app.post("/analyze", response_model=ForwardedResult)
-async def analyze_threat(request: ThreatAnalysisRequest):
-    """
-    Analyze unstructured data for cyber security threats using Groq AI.
-    Classifies threats on a scale of 1-5 and forwards results to configured endpoint
-    """
-    
-    try:
-        # Create analysis prompt
-        prompt = create_threat_analysis_prompt(request.data)
+        risk_color = risk_colors.get(risk_level, 'white')
         
-        # Call Groq API
-        chat_completion = groq_client.chat.completions.create(
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a cyber security expert. Respond only with valid JSON."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
+        is_safe = analysis.get('is_safe_to_commit', True)
+        status_icon = "✅" if is_safe else "⛔"
+        
+        console.print(Panel(
+            f"{status_icon} [bold]Security Analysis Complete[/bold]\n\n"
+            f"Risk Level: [{risk_color}]{risk_level}[/{risk_color}]\n"
+            f"Security Score: [cyan]{analysis.get('security_score', 0)}/100[/cyan]\n"
+            f"Safe to Commit: [{'green' if is_safe else 'red'}]{'YES' if is_safe else 'NO'}[/{'green' if is_safe else 'red'}]",
+            title="🛡️  Adapt Security Review",
+            border_style="blue"
+        ))
+        
+        # Summary
+        console.print(f"\n[bold]Summary:[/bold] {analysis.get('summary', 'No summary available')}\n")
+        
+        # Vulnerabilities
+        vulnerabilities = analysis.get('vulnerabilities', [])
+        if vulnerabilities:
+            console.print("[bold red]🔴 Security Issues Found:[/bold red]\n")
+            
+            for i, vuln in enumerate(vulnerabilities, 1):
+                severity = vuln.get('severity', 'unknown').upper()
+                severity_colors = {
+                    'LOW': 'yellow',
+                    'MEDIUM': 'orange',
+                    'HIGH': 'red',
+                    'CRITICAL': 'bold red'
                 }
-            ],
-            model=request.model,
-            temperature=0.2,
-            max_tokens=1000,
-            response_format={"type": "json_object"}
-        )
-        
-        # Parse Groq response
-        response_content = chat_completion.choices[0].message.content
-        analysis_result = json.loads(response_content)
-        
-        # Validate threat level
-        threat_level = analysis_result.get("threat_level")
-        if not isinstance(threat_level, int) or not (1 <= threat_level <= 5):
-            raise ValueError("Invalid threat level returned by model")
-        
-        # Create response object
-        threat_response = ThreatAnalysisResponse(
-            threat_level=threat_level,
-            threat_category=analysis_result.get("threat_category", "Unknown"),
-            analysis=analysis_result.get("analysis", "No analysis provided"),
-            raw_data=request.data,
-            model_used=request.model
-        )
-        
-        # Forward to configured endpoint
-        try:
-            async with httpx.AsyncClient() as client:
-                forward_response = await client.post(
-                    SEND_URL,
-                    json=threat_response.model_dump(),
-                    timeout=10.0
-                )
+                severity_color = severity_colors.get(severity, 'white')
                 
-                if forward_response.status_code == 200:
-                    return ForwardedResult(
-                        success=True,
-                        message="Threat analysis completed and forwarded successfully",
-                        original_response=threat_response
-                    )
-                else:
-                    return ForwardedResult(
-                        success=False,
-                        message=f"Threat analysis completed but forwarding failed with status {forward_response.status_code}",
-                        original_response=threat_response
-                    )
-                    
-        except httpx.ConnectError:
-            return ForwardedResult(
-                success=False,
-                message=f"Threat analysis completed but could not connect to {SEND_URL}",
-                original_response=threat_response
-            )
-        except Exception as forward_error:
-            return ForwardedResult(
-                success=False,
-                message=f"Threat analysis completed but forwarding error: {str(forward_error)}",
-                original_response=threat_response
-            )
+                console.print(Panel(
+                    f"[bold]Type:[/bold] {vuln.get('type', 'Unknown')}\n"
+                    f"[bold]File:[/bold] {vuln.get('file', 'Unknown')}\n"
+                    f"[bold]Line:[/bold] {vuln.get('line', 'Unknown')}\n"
+                    f"[bold]Severity:[/bold] [{severity_color}]{severity}[/{severity_color}]\n\n"
+                    f"[bold]Description:[/bold]\n{vuln.get('description', 'No description')}\n\n"
+                    f"[bold]Recommendation:[/bold]\n{vuln.get('recommendation', 'No recommendation')}\n\n"
+                    f"[bold]Code:[/bold]\n```\n{vuln.get('code_snippet', 'N/A')}\n```",
+                    title=f"Issue #{i}",
+                    border_style=severity_color
+                ))
+                console.print()
+        
+        # Positive findings
+        positive = analysis.get('positive_findings', [])
+        if positive:
+            console.print("[bold green]✅ Good Security Practices:[/bold green]\n")
+            for finding in positive:
+                console.print(f"  • {finding}")
+            console.print()
+        
+        # Recommendations
+        recommendations = analysis.get('recommendations', [])
+        if recommendations:
+            console.print("[bold cyan]💡 Recommendations:[/bold cyan]\n")
+            for rec in recommendations:
+                console.print(f"  • {rec}")
+            console.print()
+        
+        # Files analyzed
+        console.print("[bold]📁 Files Analyzed:[/bold]")
+        table = Table(box=box.ROUNDED)
+        table.add_column("File", style="cyan")
+        table.add_column("Status", style="yellow")
+        
+        for change in changes:
+            table.add_row(change['filename'], change['status'])
+        
+        console.print(table)
+        console.print()
+    
+    def _save_report(self, analysis: Dict, changes: List[Dict[str, str]]):
+        """Save analysis report to file"""
+        report_dir = self.repo_root / '.adapt-security'
+        report_dir.mkdir(exist_ok=True)
+        
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        report_file = report_dir / f'review_{timestamp}.json'
+        
+        report = {
+            'timestamp': datetime.now().isoformat(),
+            'analysis': analysis,
+            'files_reviewed': [
+                {
+                    'filename': change['filename'],
+                    'status': change['status']
+                }
+                for change in changes
+            ]
+        }
+        
+        with open(report_file, 'w') as f:
+            json.dump(report, f, indent=2)
+        
+        console.print(f"[dim]💾 Report saved to: {report_file}[/dim]\n")
+    
+    def review(self, save_report: bool = True):
+        """Main review function"""
+        console.print("[bold blue]🚀 Starting Adapt Security Review...[/bold blue]\n")
+        
+        # Get staged changes
+        changes = self._get_staged_changes()
+        
+        if not changes:
+            console.print("[yellow]⚠️  No staged changes found. Use 'git add' first.[/yellow]")
+            return
+        
+        console.print(f"[cyan]Found {len(changes)} file(s) to review[/cyan]\n")
+        
+        # Analyze
+        analysis = self._analyze_with_groq(changes)
+        
+        if not analysis:
+            console.print("[red]❌ Analysis failed[/red]")
+            return
+        
+        # Display results
+        self._display_results(analysis, changes)
+        
+        # Save report
+        if save_report:
+            self._save_report(analysis, changes)
+        
+        # Ask to proceed
+        is_safe = analysis.get('is_safe_to_commit', True)
+        
+        if not is_safe:
+            console.print("[bold red]⚠️  SECURITY ISSUES DETECTED[/bold red]")
+            console.print("[yellow]It's recommended to fix the issues before committing.[/yellow]\n")
             
-    except json.JSONDecodeError as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to parse Groq response as JSON: {str(e)}"
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error during threat analysis: {str(e)}"
-        )
-
-# GitHub webhook endpoint
-@app.post("/webhook", response_model=GitHubWebhookResponse)
-async def webhook(
-    request: Request,
-    x_hub_signature_256: Optional[str] = Header(None, alias="X-Hub-Signature-256"),
-    x_github_event: Optional[str] = Header(None, alias="X-GitHub-Event")
-):
-    """
-    GitHub webhook endpoint for code security analysis.
-    Analyzes code changes in push events for security vulnerabilities.
-    """
-    
-    # Get raw body for signature verification
-    body = await request.body()
-    
-    # Verify signature
-    if not verify_signature(body, x_hub_signature_256):
-        raise HTTPException(status_code=403, detail="Invalid signature")
-    
-    # Only process push events
-    if x_github_event != 'push':
-        return GitHubWebhookResponse(
-            status="ignored",
-            reason=f"Event type '{x_github_event}' is not processed"
-        )
-    
-    try:
-        payload = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
-    
-    # Extract relevant information
-    repo_full_name = payload.get('repository', {}).get('full_name')
-    commits = payload.get('commits', [])
-    
-    if not repo_full_name:
-        raise HTTPException(status_code=400, detail="Missing repository information")
-    
-    if not commits:
-        return GitHubWebhookResponse(
-            status="skipped",
-            reason="No commits to analyze"
-        )
-    
-    # Get the latest commit SHA
-    commit_sha = commits[-1].get('id')
-    
-    if not commit_sha:
-        raise HTTPException(status_code=400, detail="Missing commit SHA")
-    
-    # Get commit details from GitHub API
-    if not GITHUB_TOKEN:
-        raise HTTPException(
-            status_code=500,
-            detail="GITHUB_TOKEN environment variable not set"
-        )
-    
-    commit_url = f"https://api.github.com/repos/{repo_full_name}/commits/{commit_sha}"
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.v3+json"
-    }
-    
-    try:
-        async with httpx.AsyncClient() as client:
-            commit_response = await client.get(commit_url, headers=headers, timeout=10.0)
-            
-            if commit_response.status_code != 200:
-                raise HTTPException(
-                    status_code=500,
-                    detail="Failed to fetch commit details from GitHub"
-                )
-            
-            files_changed = commit_response.json().get('files', [])
-    except httpx.RequestError as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error fetching commit details: {str(e)}"
-        )
-    
-    # Analyze with Groq
-    analysis = await analyze_code_with_groq(files_changed)
-    
-    if analysis:
-        try:
-            # Try to parse as JSON
-            result = json.loads(analysis)
-            
-            if not result.get('is_safe', True):
-                # Block the push
-                vulnerabilities = ", ".join(
-                    result.get('vulnerabilities', ['Security issues detected'])
-                )
-                await block_push(
-                    repo_full_name,
-                    commit_sha,
-                    f"Security issues: {vulnerabilities}"
-                )
-                
-                return GitHubWebhookResponse(
-                    status="blocked",
-                    reason=vulnerabilities,
-                    severity=result.get('severity', 'unknown'),
-                    recommendation=result.get('recommendation', '')
-                )
+            if Confirm.ask("Do you want to proceed with commit anyway?"):
+                console.print("[yellow]⚠️  Proceeding with commit (not recommended)[/yellow]")
             else:
-                # Approve the push
-                await approve_push(repo_full_name, commit_sha)
-                return GitHubWebhookResponse(
-                    status="approved",
-                    reason="No security vulnerabilities detected"
-                )
+                console.print("[green]✅ Commit cancelled. Fix the issues and try again.[/green]")
+                sys.exit(1)
+        else:
+            console.print("[bold green]✅ All checks passed! Safe to commit.[/bold green]")
+    
+    def history(self, limit: int = 10):
+        """Show review history"""
+        report_dir = self.repo_root / '.adapt-security'
+        
+        if not report_dir.exists():
+            console.print("[yellow]No review history found[/yellow]")
+            return
+        
+        reports = sorted(report_dir.glob('review_*.json'), reverse=True)[:limit]
+        
+        if not reports:
+            console.print("[yellow]No review history found[/yellow]")
+            return
+        
+        console.print(f"[bold]📊 Last {len(reports)} Reviews:[/bold]\n")
+        
+        table = Table(box=box.ROUNDED)
+        table.add_column("Date", style="cyan")
+        table.add_column("Risk", style="yellow")
+        table.add_column("Score", style="green")
+        table.add_column("Issues", style="red")
+        table.add_column("Files", style="blue")
+        
+        for report_file in reports:
+            with open(report_file) as f:
+                data = json.load(f)
+                analysis = data.get('analysis', {})
                 
-        except json.JSONDecodeError:
-            # If not JSON, treat as text analysis
-            analysis_lower = analysis.lower()
-            if "vulnerability" in analysis_lower or "risk" in analysis_lower:
-                await block_push(
-                    repo_full_name,
-                    commit_sha,
-                    "Potential security issues detected"
-                )
-                return GitHubWebhookResponse(
-                    status="blocked",
-                    reason="Potential security issues detected",
-                    severity="unknown"
-                )
-    
-    # Default to approval if analysis fails
-    await approve_push(repo_full_name, commit_sha)
-    return GitHubWebhookResponse(
-        status="approved",
-        reason="Analysis completed with no issues found"
+                timestamp = datetime.fromisoformat(data['timestamp'])
+                date_str = timestamp.strftime('%Y-%m-%d %H:%M')
+                
+                risk = analysis.get('overall_risk', 'unknown').upper()
+                score = f"{analysis.get('security_score', 0)}/100"
+                issues = len(analysis.get('vulnerabilities', []))
+                files = len(data.get('files_reviewed', []))
+                
+                table.add_row(date_str, risk, score, str(issues), str(files))
+        
+        console.print(table)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='🛡️  Adapt Security - AI-Powered Code Security Review',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  adapt review              # Review staged changes
+  adapt review --no-save    # Review without saving report
+  adapt history             # Show review history
+  adapt history --limit 20  # Show last 20 reviews
+        """
     )
+    
+    subparsers = parser.add_subparsers(dest='command', help='Commands')
+    
+    # Review command
+    review_parser = subparsers.add_parser('review', help='Review staged changes')
+    review_parser.add_argument('--no-save', action='store_true', help='Don\'t save report')
+    
+    # History command
+    history_parser = subparsers.add_parser('history', help='Show review history')
+    history_parser.add_argument('--limit', type=int, default=10, help='Number of reports to show')
+    
+    args = parser.parse_args()
+    
+    if not args.command:
+        parser.print_help()
+        return
+    
+    cli = AdaptSecurityCLI()
+    
+    if args.command == 'review':
+        cli.review(save_report=not args.no_save)
+    elif args.command == 'history':
+        cli.history(limit=args.limit)
 
-# Example usage and testing endpoint
-@app.post("/test-example")
-async def test_example():
-    """Test endpoint with example data"""
-    example_data = {
-        "timestamp": "2024-11-02T10:30:00Z",
-        "source_ip": "192.168.1.100",
-        "destination_ip": "10.0.0.5",
-        "event_type": "failed_login",
-        "attempts": 50,
-        "user_agent": "Mozilla/5.0",
-        "log": "Multiple failed authentication attempts detected"
-    }
-    
-    request_model = ThreatAnalysisRequest(data=example_data)
-    return await analyze_threat(request_model)
 
-if __name__ == "__main__":
-    import uvicorn
-    
-    # Check for API key
-    if not os.environ.get("GROQ_API_KEY"):
-        print("WARNING: GROQ_API_KEY environment variable not set!")
-        print("Set it using: export GROQ_API_KEY='your-api-key-here'")
-    
-    # Run the server
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+if __name__ == '__main__':
+    main()
