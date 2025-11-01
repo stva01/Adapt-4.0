@@ -3,7 +3,7 @@
 Adapt Security CLI & Webhook - AI-Powered Code Security Review
 Inspired by CodeRabbit, powered by Groq AI
 """
-
+new_password='123@abc'
 import os
 import sys
 import subprocess
@@ -234,7 +234,7 @@ Be thorough but also acknowledge good security practices."""
                 progress.add_task("analyze", total=None)
                 
                 response = self.client.chat.completions.create(
-                    model="llama-3.1-70b-versatile",
+                    model="llama-3.3-70b-versatile",
                     messages=[
                         {
                             "role": "system",
@@ -266,7 +266,7 @@ Be thorough but also acknowledge good security practices."""
         risk_colors = {
             'SAFE': 'green',
             'LOW': 'yellow',
-            'MEDIUM': 'orange',
+            'MEDIUM': 'bright_yellow',
             'HIGH': 'red',
             'CRITICAL': 'bold red'
         }
@@ -296,7 +296,7 @@ Be thorough but also acknowledge good security practices."""
                 severity = vuln.get('severity', 'unknown').upper()
                 severity_colors = {
                     'LOW': 'yellow',
-                    'MEDIUM': 'orange',
+                    'MEDIUM': 'bright_yellow',
                     'HIGH': 'red',
                     'CRITICAL': 'bold red'
                 }
